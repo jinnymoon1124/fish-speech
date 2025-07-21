@@ -23,7 +23,7 @@ def parse_args():
         "--url",
         "-u",
         type=str,
-        default="http://127.0.0.1:8080/v1/tts",
+        default="http://10.202.15.248:7860/v1/tts",
         help="URL of the server",
     )
     parser.add_argument(
