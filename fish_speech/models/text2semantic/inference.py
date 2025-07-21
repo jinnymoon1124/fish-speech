@@ -363,7 +363,7 @@ def generate_long(
     text: str,
     num_samples: int = 1,
     max_new_tokens: int = 0,
-    top_p: int = 0.8,
+    top_p: float = 0.8,
     repetition_penalty: float = 1.1,
     temperature: float = 0.8,
     compile: bool = False,
@@ -385,39 +385,11 @@ def generate_long(
         prompt_tokens
     ), "Prompt text and tokens must have the same length"
 
-    prompt_tokens = [i.cpu() for i in prompt_tokens]
+    if prompt_tokens is not None:
+        prompt_tokens = [i.cpu() for i in prompt_tokens]
 
     model_size = sum(p.numel() for p in model.parameters() if p.requires_grad)
     tokenizer = model.tokenizer
-    base_content_sequence = ContentSequence(modality="interleave")
-
-    max_length = model.config.max_seq_len
-    if use_prompt:
-        for t, c in zip(prompt_text, prompt_tokens):
-            base_content_sequence.append(
-                [
-                    TextPart(text=t),
-                    VQPart(codes=c),
-                ],
-                add_end=True,
-                speaker=0,
-            )
-    base_content_sequence.append(
-        [
-            TextPart(text=text),
-        ],
-        add_end=False,
-        speaker=0,
-    )
-
-    encoded, audio_masks, audio_parts = base_content_sequence.encode_for_inference(
-        tokenizer, num_codebooks=model.config.num_codebooks
-    )
-    if encoded.size(1) > max_length - 2048:
-        raise ValueError(f"Prompt is too long: {encoded.size(1)} > {max_length - 2048}")
-
-    encoded = encoded.to(device=device)
-    logger.info(f"Encoded text: {text}")
 
     # Move temperature, top_p, repetition_penalty to device
     # This is important so that changing params doesn't trigger recompile
@@ -427,59 +399,147 @@ def generate_long(
         repetition_penalty, device=device, dtype=torch.float
     )
 
+    # Split text into chunks if iterative prompting is enabled
+    if iterative_prompt and chunk_length > 0:
+        # Simple sentence-based chunking
+        sentences = text.replace('。', '。\n').replace('!', '!\n').replace('?', '?\n').replace('.', '.\n').strip().split('\n')
+        sentences = [s.strip() for s in sentences if s.strip()]
+        
+        text_chunks = []
+        current_chunk = ""
+        
+        for sentence in sentences:
+            if len(current_chunk) + len(sentence) <= chunk_length:
+                current_chunk += sentence
+            else:
+                if current_chunk:
+                    text_chunks.append(current_chunk.strip())
+                current_chunk = sentence
+        
+        if current_chunk:
+            text_chunks.append(current_chunk.strip())
+        
+        # If text is short enough, process as single chunk
+        if len(text_chunks) <= 1:
+            text_chunks = [text]
+    else:
+        text_chunks = [text]
+
+    logger.info(f"Processing text in {len(text_chunks)} chunks")
+
     for sample_idx in range(num_samples):
         if torch.cuda.is_available():
             torch.cuda.synchronize()
 
         global_encoded = []
-        seg_idx = 0
-        prompt_length = encoded.size(1)
-
-        t0 = time.perf_counter()
-        y = generate(
-            model=model,
-            prompt=encoded,
-            max_new_tokens=max_new_tokens,
-            audio_masks=audio_masks,
-            audio_parts=audio_parts,
-            decode_one_token=decode_one_token,
-            temperature=temperature,
-            top_p=top_p,
-            repetition_penalty=repetition_penalty,
-        )
-
-        if sample_idx == 0 and seg_idx == 0 and compile:
-            logger.info(f"Compilation time: {time.perf_counter() - t0:.2f} seconds")
-
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-
-        t = time.perf_counter() - t0
-
-        tokens_generated = y.size(1) - prompt_length
-        tokens_sec = tokens_generated / t
-        logger.info(
-            f"Generated {tokens_generated} tokens in {t:.02f} seconds, {tokens_sec:.02f} tokens/sec"
-        )
-        logger.info(f"Bandwidth achieved: {model_size * tokens_sec / 1e9:.02f} GB/s")
-
-        if torch.cuda.is_available():
-            logger.info(
-                f"GPU Memory used: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB"
+        all_codes = []
+        
+        # Process each chunk
+        for chunk_idx, chunk_text in enumerate(text_chunks):
+            base_content_sequence = ContentSequence(modality="interleave")
+            max_length = model.config.max_seq_len
+            
+            # Add reference prompts for the first chunk
+            if chunk_idx == 0 and use_prompt:
+                for t, c in zip(prompt_text, prompt_tokens):
+                    base_content_sequence.append(
+                        [
+                            TextPart(text=t),
+                            VQPart(codes=c),
+                        ],
+                        add_end=True,
+                        speaker=0,
+                    )
+            
+            # For subsequent chunks, use previous generated audio as prompt
+            elif chunk_idx > 0 and len(all_codes) > 0:
+                # Use the last generated audio as prompt for continuity
+                prev_codes = all_codes[-1].cpu()  # Ensure it's on CPU for content sequence
+                if len(prev_codes.shape) == 2 and prev_codes.shape[1] > 50:
+                    # Use last 50 tokens as prompt to maintain context
+                    prompt_codes = prev_codes[:, -50:]
+                    base_content_sequence.append(
+                        [
+                            VQPart(codes=prompt_codes),
+                        ],
+                        add_end=True,
+                        speaker=0,
+                    )
+            
+            base_content_sequence.append(
+                [
+                    TextPart(text=chunk_text),
+                ],
+                add_end=False,
+                speaker=0,
             )
 
-        # Put the generated tokens
-        # since there is <im_end>, we remove last token
-        codes = y[1:, prompt_length:-1].clone()
-        assert (codes >= 0).all(), f"Negative code found"
+            encoded, audio_masks, audio_parts = base_content_sequence.encode_for_inference(
+                tokenizer, num_codebooks=model.config.num_codebooks
+            )
+            if encoded.size(1) > max_length - 2048:
+                logger.warning(f"Chunk {chunk_idx} is too long: {encoded.size(1)} > {max_length - 2048}, truncating")
+                encoded = encoded[:, :max_length - 2048]
+                audio_masks = audio_masks[:max_length - 2048]
+                if audio_parts is not None:
+                    audio_parts = audio_parts[:max_length - 2048]
 
-        decoded = y[:, prompt_length:].clone()
-        # But for global encoding, we should keep the <im_end> token
+            encoded = encoded.to(device=device)
+            logger.info(f"Processing chunk {chunk_idx + 1}/{len(text_chunks)}: {chunk_text[:50]}...")
 
-        global_encoded.append(decoded.cpu())
-        assert (codes >= 0).all(), f"Negative code found: {codes}"
-        yield GenerateResponse(action="sample", codes=codes, text=text)
-        seg_idx += 1
+            prompt_length = encoded.size(1)
+
+            t0 = time.perf_counter()
+            y = generate(
+                model=model,
+                prompt=encoded,
+                max_new_tokens=max_new_tokens,
+                audio_masks=audio_masks,
+                audio_parts=audio_parts,
+                decode_one_token=decode_one_token,
+                temperature=temperature,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+            )
+
+            if sample_idx == 0 and chunk_idx == 0 and compile:
+                logger.info(f"Compilation time: {time.perf_counter() - t0:.2f} seconds")
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+
+            t = time.perf_counter() - t0
+
+            tokens_generated = y.size(1) - prompt_length
+            tokens_sec = tokens_generated / t
+            logger.info(
+                f"Chunk {chunk_idx + 1}: Generated {tokens_generated} tokens in {t:.02f} seconds, {tokens_sec:.02f} tokens/sec"
+            )
+
+            if torch.cuda.is_available():
+                logger.info(
+                    f"GPU Memory used: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB"
+                )
+
+            # Put the generated tokens
+            # since there is <im_end>, we remove last token
+            codes = y[1:, prompt_length:-1].clone()
+            assert (codes >= 0).all(), f"Negative code found"
+            
+            all_codes.append(codes)
+
+            decoded = y[:, prompt_length:].clone()
+            # But for global encoding, we should keep the <im_end> token
+            global_encoded.append(decoded.cpu())
+            
+            assert (codes >= 0).all(), f"Negative code found: {codes}"
+            yield GenerateResponse(action="sample", codes=codes, text=chunk_text)
+
+        # Log total statistics
+        total_tokens = sum(codes.size(1) for codes in all_codes)
+        logger.info(f"Total tokens generated for sample {sample_idx + 1}: {total_tokens}")
+        if 'tokens_sec' in locals():
+            logger.info(f"Bandwidth achieved: {model_size * tokens_sec / 1e9:.02f} GB/s")
 
         # This indicates the end of the current sample
         yield GenerateResponse(action="next")
