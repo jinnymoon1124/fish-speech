@@ -485,9 +485,10 @@ def generate_long(
                     # Truncate original reference if too long to save context
                     if main_ref_tokens.shape[1] > 100:
                         truncated_tokens = main_ref_tokens[:, :100]
-                        logger.info(f"  Truncated original reference: {main_ref_tokens.shape} -> {truncated_tokens.shape}")
+                        logger.info(f"  Using truncated original reference: {main_ref_tokens.shape} -> {truncated_tokens.shape}")
                     else:
                         truncated_tokens = main_ref_tokens
+                        logger.info(f"  Using full original reference: {main_ref_tokens.shape}")
                     
                     base_content_sequence.append(
                         [
@@ -497,28 +498,11 @@ def generate_long(
                         add_end=True,
                         speaker=0,
                     )
+                else:
+                    logger.info(f"⚠️ No original reference available for chunk {chunk_idx + 1} - voice may drift")
                 
-                # Add recent generated audio as additional context
-                if len(all_codes) > 0:
-                    prev_codes = all_codes[-1].cpu()
-                    logger.info(f"  Previous generated codes shape: {prev_codes.shape}")
-                    
-                    if len(prev_codes.shape) == 2 and prev_codes.shape[1] > 50:
-                        # Use a shorter, more recent segment to avoid drift
-                        start_idx = max(0, prev_codes.shape[1] - 80)
-                        end_idx = prev_codes.shape[1] - 10  # Leave some buffer
-                        prompt_codes = prev_codes[:, start_idx:end_idx]
-                        
-                        logger.info(f"  Adding recent generated audio as context: {prompt_codes.shape}")
-                        base_content_sequence.append(
-                            [
-                                VQPart(codes=prompt_codes),
-                            ],
-                            add_end=True,
-                            speaker=0,
-                        )
-                    else:
-                        logger.warning(f"  Previous codes too short, skipping: {prev_codes.shape}")
+                # Note: Removed recent generated audio combination to prevent voice drift
+                logger.info(f"  ✅ Using ONLY original reference audio to prevent voice drift")
             
             base_content_sequence.append(
                 [

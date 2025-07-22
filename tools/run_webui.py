@@ -82,23 +82,23 @@ if __name__ == "__main__":
     )
 
     # Dry run to check if the model is loaded correctly and avoid the first-time latency
-    list(
-        inference_engine.inference(
-            ServeTTSRequest(
-                text="Hello world.",
-                references=[],
-                reference_id=None,
-                max_new_tokens=1024,
-                chunk_length=200,
-                top_p=0.7,
-                repetition_penalty=1.5,
-                temperature=0.7,
-                format="wav",
-            )
-        )
-    )
+    # list(
+    #     inference_engine.inference(
+    #         ServeTTSRequest(
+    #             text="Hello world.",
+    #             references=[],
+    #             reference_id=None,
+    #             max_new_tokens=1024,
+    #             chunk_length=200,
+    #             top_p=0.7,
+    #             repetition_penalty=1.5,
+    #             temperature=0.7,
+    #             format="wav",
+    #         )
+    #     )
+    # )
 
-    logger.info("Warming up done, launching the web UI...")
+    # logger.info("Warming up done, launching the web UI...")
 
     # Get the inference function with the immutable arguments
     inference_fct = get_inference_wrapper(inference_engine)
