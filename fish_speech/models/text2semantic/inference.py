@@ -190,7 +190,7 @@ def decode_n_tokens(
 
     for i in tqdm(range(num_new_tokens)):
         # We need to get windowed repeat penalty
-        win_size = 16
+        win_size = 32
         if i < win_size:
             window = previous_tokens[:, :win_size]
         else:
@@ -453,11 +453,14 @@ def generate_long(
             
             # For subsequent chunks, use previous generated audio as prompt
             elif chunk_idx > 0 and len(all_codes) > 0:
-                # Use the last generated audio as prompt for continuity
-                prev_codes = all_codes[-1].cpu()  # Ensure it's on CPU for content sequence
-                if len(prev_codes.shape) == 2 and prev_codes.shape[1] > 50:
-                    # Use last 50 tokens as prompt to maintain context
-                    prompt_codes = prev_codes[:, -50:]
+                # 더 많은 토큰을 사용하고, 중간 부분을 선택
+                prev_codes = all_codes[-1].cpu()
+                if len(prev_codes.shape) == 2 and prev_codes.shape[1] > 100:
+                    # 마지막이 아닌 중간 부분을 사용하여 안정성 증대
+                    start_idx = max(0, prev_codes.shape[1] - 150)
+                    end_idx = prev_codes.shape[1] - 50
+                    prompt_codes = prev_codes[:, start_idx:end_idx]
+                    # 가중평균으로 부드럽게 연결
                     base_content_sequence.append(
                         [
                             VQPart(codes=prompt_codes),
