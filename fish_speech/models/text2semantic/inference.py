@@ -6,7 +6,7 @@ import traceback
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Optional, Tuple, Union
+from typing import Literal, Optional, Tuple, Union, Callable, Dict, Any
 
 import click
 import numpy as np
@@ -358,8 +358,8 @@ class GenerateResponse:
 def generate_long(
     *,
     model,
-    device: str | torch.device,
-    decode_one_token: callable,
+    device: Union[str, torch.device],
+    decode_one_token: Callable[..., torch.Tensor],
     text: str,
     num_samples: int = 1,
     max_new_tokens: int = 0,
@@ -369,8 +369,8 @@ def generate_long(
     compile: bool = False,
     iterative_prompt: bool = True,
     chunk_length: int = 512,
-    prompt_text: Optional[str | list[str]] = None,
-    prompt_tokens: Optional[torch.Tensor | list[torch.Tensor]] = None,
+    prompt_text: Optional[Union[str, list[str]]] = None,
+    prompt_tokens: Optional[Union[torch.Tensor, list[torch.Tensor]]] = None,
 ):
     assert 0 < top_p <= 1, "top_p must be in (0, 1]"
     assert 0 < repetition_penalty < 2, "repetition_penalty must be in (0, 2)"
@@ -381,9 +381,10 @@ def generate_long(
         prompt_text = [prompt_text]
         prompt_tokens = [prompt_tokens]
 
-    assert use_prompt is False or len(prompt_text) == len(
-        prompt_tokens
-    ), "Prompt text and tokens must have the same length"
+    # Type guard to ensure we have lists when use_prompt is True
+    if use_prompt:
+        assert isinstance(prompt_text, list) and isinstance(prompt_tokens, list), "Prompt text and tokens must be lists when using prompts"
+        assert len(prompt_text) == len(prompt_tokens), "Prompt text and tokens must have the same length"
 
     if prompt_tokens is not None:
         prompt_tokens = [i.cpu() for i in prompt_tokens]
@@ -398,6 +399,14 @@ def generate_long(
     repetition_penalty = torch.tensor(
         repetition_penalty, device=device, dtype=torch.float
     )
+
+    # Log reference audio information
+    if use_prompt and prompt_text is not None and prompt_tokens is not None:
+        logger.info(f"🎵 Using reference audio prompts: {len(prompt_text)} references")
+        for i, (text_item, tokens) in enumerate(zip(prompt_text, prompt_tokens)):
+            logger.info(f"  Reference {i+1}: text='{text_item[:50]}...' tokens_shape={tokens.shape}")
+    else:
+        logger.info("🚫 No reference audio provided - using random voice")
 
     # Split text into chunks if iterative prompting is enabled
     if iterative_prompt and chunk_length > 0:
@@ -425,7 +434,9 @@ def generate_long(
     else:
         text_chunks = [text]
 
-    logger.info(f"Processing text in {len(text_chunks)} chunks")
+    logger.info(f"📝 Processing text in {len(text_chunks)} chunks")
+    for i, chunk in enumerate(text_chunks):
+        logger.info(f"  Chunk {i+1}: '{chunk[:50]}...' (length: {len(chunk)})")
 
     for sample_idx in range(num_samples):
         if torch.cuda.is_available():
@@ -433,15 +444,24 @@ def generate_long(
 
         global_encoded = []
         all_codes = []
+        original_reference_tokens = list(prompt_tokens) if prompt_tokens else None
+        original_reference_texts = list(prompt_text) if prompt_text else None
+        tokens_sec = None  # Initialize to track token generation speed
+        
+        logger.info(f"🎯 Starting sample {sample_idx + 1}/{num_samples}")
         
         # Process each chunk
         for chunk_idx, chunk_text in enumerate(text_chunks):
             base_content_sequence = ContentSequence(modality="interleave")
             max_length = model.config.max_seq_len
             
+            logger.info(f"🔄 Processing chunk {chunk_idx + 1}/{len(text_chunks)}")
+            
             # Add reference prompts for the first chunk
-            if chunk_idx == 0 and use_prompt:
-                for t, c in zip(prompt_text, prompt_tokens):
+            if chunk_idx == 0 and use_prompt and original_reference_texts is not None and original_reference_tokens is not None:
+                logger.info(f"📌 Adding original reference audio to first chunk")
+                for i, (t, c) in enumerate(zip(original_reference_texts, original_reference_tokens)):
+                    logger.info(f"  Adding reference {i+1}: text='{t[:30]}...' tokens_shape={c.shape}")
                     base_content_sequence.append(
                         [
                             TextPart(text=t),
@@ -451,23 +471,54 @@ def generate_long(
                         speaker=0,
                     )
             
-            # For subsequent chunks, use previous generated audio as prompt
-            elif chunk_idx > 0 and len(all_codes) > 0:
-                # 더 많은 토큰을 사용하고, 중간 부분을 선택
-                prev_codes = all_codes[-1].cpu()
-                if len(prev_codes.shape) == 2 and prev_codes.shape[1] > 100:
-                    # 마지막이 아닌 중간 부분을 사용하여 안정성 증대
-                    start_idx = max(0, prev_codes.shape[1] - 150)
-                    end_idx = prev_codes.shape[1] - 50
-                    prompt_codes = prev_codes[:, start_idx:end_idx]
-                    # 가중평균으로 부드럽게 연결
+            # For subsequent chunks, combine original reference with recent generated audio
+            elif chunk_idx > 0:
+                logger.info(f"🔗 Handling reference for chunk {chunk_idx + 1}")
+                
+                # Always include original reference to maintain voice consistency
+                if use_prompt and original_reference_tokens is not None and original_reference_texts is not None:
+                    logger.info(f"📌 Re-adding original reference audio for voice consistency")
+                    # Use only the first (most important) original reference
+                    main_ref_text = original_reference_texts[0]
+                    main_ref_tokens = original_reference_tokens[0]
+                    
+                    # Truncate original reference if too long to save context
+                    if main_ref_tokens.shape[1] > 100:
+                        truncated_tokens = main_ref_tokens[:, :100]
+                        logger.info(f"  Truncated original reference: {main_ref_tokens.shape} -> {truncated_tokens.shape}")
+                    else:
+                        truncated_tokens = main_ref_tokens
+                    
                     base_content_sequence.append(
                         [
-                            VQPart(codes=prompt_codes),
+                            TextPart(text=main_ref_text),
+                            VQPart(codes=truncated_tokens),
                         ],
                         add_end=True,
                         speaker=0,
                     )
+                
+                # Add recent generated audio as additional context
+                if len(all_codes) > 0:
+                    prev_codes = all_codes[-1].cpu()
+                    logger.info(f"  Previous generated codes shape: {prev_codes.shape}")
+                    
+                    if len(prev_codes.shape) == 2 and prev_codes.shape[1] > 50:
+                        # Use a shorter, more recent segment to avoid drift
+                        start_idx = max(0, prev_codes.shape[1] - 80)
+                        end_idx = prev_codes.shape[1] - 10  # Leave some buffer
+                        prompt_codes = prev_codes[:, start_idx:end_idx]
+                        
+                        logger.info(f"  Adding recent generated audio as context: {prompt_codes.shape}")
+                        base_content_sequence.append(
+                            [
+                                VQPart(codes=prompt_codes),
+                            ],
+                            add_end=True,
+                            speaker=0,
+                        )
+                    else:
+                        logger.warning(f"  Previous codes too short, skipping: {prev_codes.shape}")
             
             base_content_sequence.append(
                 [
@@ -480,15 +531,18 @@ def generate_long(
             encoded, audio_masks, audio_parts = base_content_sequence.encode_for_inference(
                 tokenizer, num_codebooks=model.config.num_codebooks
             )
+            
+            logger.info(f"  Encoded sequence length: {encoded.size(1)}")
+            
             if encoded.size(1) > max_length - 2048:
-                logger.warning(f"Chunk {chunk_idx} is too long: {encoded.size(1)} > {max_length - 2048}, truncating")
+                logger.warning(f"  Chunk {chunk_idx} too long: {encoded.size(1)} > {max_length - 2048}, truncating")
                 encoded = encoded[:, :max_length - 2048]
                 audio_masks = audio_masks[:max_length - 2048]
                 if audio_parts is not None:
                     audio_parts = audio_parts[:max_length - 2048]
 
             encoded = encoded.to(device=device)
-            logger.info(f"Processing chunk {chunk_idx + 1}/{len(text_chunks)}: {chunk_text[:50]}...")
+            logger.info(f"🎬 Generating audio for chunk {chunk_idx + 1}: '{chunk_text[:50]}...'")
 
             prompt_length = encoded.size(1)
 
@@ -506,7 +560,7 @@ def generate_long(
             )
 
             if sample_idx == 0 and chunk_idx == 0 and compile:
-                logger.info(f"Compilation time: {time.perf_counter() - t0:.2f} seconds")
+                logger.info(f"⚡ Compilation time: {time.perf_counter() - t0:.2f} seconds")
 
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
@@ -514,14 +568,14 @@ def generate_long(
             t = time.perf_counter() - t0
 
             tokens_generated = y.size(1) - prompt_length
-            tokens_sec = tokens_generated / t
+            tokens_sec = tokens_generated / t if t > 0 else 0 # Calculate tokens_sec here
             logger.info(
-                f"Chunk {chunk_idx + 1}: Generated {tokens_generated} tokens in {t:.02f} seconds, {tokens_sec:.02f} tokens/sec"
+                f"✅ Chunk {chunk_idx + 1} completed: {tokens_generated} tokens in {t:.02f}s ({tokens_sec:.02f} tokens/sec)"
             )
 
             if torch.cuda.is_available():
                 logger.info(
-                    f"GPU Memory used: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB"
+                    f"🔥 GPU Memory used: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB"
                 )
 
             # Put the generated tokens
@@ -529,6 +583,7 @@ def generate_long(
             codes = y[1:, prompt_length:-1].clone()
             assert (codes >= 0).all(), f"Negative code found"
             
+            logger.info(f"  Generated codes shape: {codes.shape}")
             all_codes.append(codes)
 
             decoded = y[:, prompt_length:].clone()
@@ -540,9 +595,9 @@ def generate_long(
 
         # Log total statistics
         total_tokens = sum(codes.size(1) for codes in all_codes)
-        logger.info(f"Total tokens generated for sample {sample_idx + 1}: {total_tokens}")
-        if 'tokens_sec' in locals():
-            logger.info(f"Bandwidth achieved: {model_size * tokens_sec / 1e9:.02f} GB/s")
+        logger.info(f"🎉 Sample {sample_idx + 1} completed - Total tokens: {total_tokens}")
+        if tokens_sec is not None:
+            logger.info(f"📊 Bandwidth achieved: {model_size * tokens_sec / 1e9:.02f} GB/s")
 
         # This indicates the end of the current sample
         yield GenerateResponse(action="next")
@@ -556,8 +611,8 @@ class WrappedGenerateResponse:
 
 @dataclass
 class GenerateRequest:
-    request: dict
-    response_queue: queue.Queue
+    request: Dict[str, Any]
+    response_queue: queue.Queue[WrappedGenerateResponse]
 
 
 def launch_thread_safe_queue(
