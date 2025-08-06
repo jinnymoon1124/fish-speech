@@ -32,18 +32,18 @@ def build_app(inference_fct: Callable, theme: str = "light") -> gr.Blocks:
                                 chunk_length = gr.Slider(
                                     label=i18n("Iterative Prompt Length, 0 means off"),
                                     minimum=0,
-                                    maximum=400,
-                                    value=0,
+                                    maximum=1000,
+                                    value=150,  # 더 짧은 호흡과 목소리 일관성을 위해 150으로 줄임
                                     step=8,
                                 )
 
                                 max_new_tokens = gr.Slider(
                                     label=i18n(
-                                        "Maximum tokens per batch, 0 means no limit"
+                                        "Maximum tokens per batch, 0 means auto-adjust for text length"
                                     ),
                                     minimum=0,
                                     maximum=2048,
-                                    value=0,
+                                    value=0,  # 0으로 유지하여 동적 조정 활용
                                     step=8,
                                 )
 
@@ -52,7 +52,7 @@ def build_app(inference_fct: Callable, theme: str = "light") -> gr.Blocks:
                                     label="Top-P",
                                     minimum=0,
                                     maximum=0.95,
-                                    value=0.85,
+                                    value=0.8,  # 긴 텍스트에서 더 안정적인 생성을 위해 0.8로 조정
                                     step=0.01,
                                 )
 
@@ -60,7 +60,7 @@ def build_app(inference_fct: Callable, theme: str = "light") -> gr.Blocks:
                                     label=i18n("Repetition Penalty"),
                                     minimum=0,
                                     maximum=1.2,
-                                    value=1.05,
+                                    value=1.05,  # 자연스러운 억양을 위해 1.05로 감소
                                     step=0.01,
                                 )
 
@@ -69,7 +69,7 @@ def build_app(inference_fct: Callable, theme: str = "light") -> gr.Blocks:
                                     label="Temperature",
                                     minimum=0,
                                     maximum=1.0,
-                                    value=0.7,
+                                    value=0.85,  # 자연스러운 억양을 위해 0.85로 증가
                                     step=0.01,
                                 )
                                 seed = gr.Number(

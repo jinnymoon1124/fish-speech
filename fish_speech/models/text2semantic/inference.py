@@ -188,6 +188,7 @@ def decode_n_tokens(
         device=cur_token.device,
     )
 
+    i = 0  # 루프 외부에서도 사용하기 위해 초기화
     for i in tqdm(range(num_new_tokens)):
         # We need to get windowed repeat penalty
         win_size = 32
@@ -217,8 +218,17 @@ def decode_n_tokens(
             model.config.num_codebooks + 1, -1
         )
 
+        # 긴 텍스트 생성을 위해 조기 종료 조건을 완화
+        # IM_END_TOKEN이 나와도 최소한의 토큰은 생성하도록 수정
         if cur_token[0, 0, -1] == model.tokenizer.get_token_id(IM_END_TOKEN):
-            break
+            # 최소 32개 토큰은 생성하도록 보장 (약 1-2초 분량)
+            if i >= 32:
+                break
+            else:
+                # 조기 종료를 방지하기 위해 IM_END_TOKEN을 다른 토큰으로 대체
+                logger.info(f"IM_END_TOKEN detected early at step {i}, continuing generation...")
+                # 마지막 토큰을 semantic_begin_id로 대체하여 생성 계속
+                cur_token[0, 0, -1] = model.tokenizer.semantic_begin_id
 
     return previous_tokens[:, : i + 1]
 
@@ -410,27 +420,102 @@ def generate_long(
 
     # Split text into chunks if iterative prompting is enabled
     if iterative_prompt and chunk_length > 0:
-        # Simple sentence-based chunking
-        sentences = text.replace('。', '。\n').replace('!', '!\n').replace('?', '?\n').replace('.', '.\n').strip().split('\n')
-        sentences = [s.strip() for s in sentences if s.strip()]
+        # 강사 영상의 특성을 고려한 자연스러운 호흡과 말의 흐름을 위한 청킹
+        # 움직임이 많고 핸드마이크 사용 등을 고려하여 더 자연스러운 구간 분할
+        text_with_pauses = text
+        
+        # 다양한 언어의 문장 부호 처리 (한국어, 영어, 일본어 등)
+        pause_replacements = [
+            ('。', '。 '),   # 일본어 마침표
+            ('！', '！ '),   # 일본어 느낌표  
+            ('？', '？ '),   # 일본어 물음표
+            ('.', '. '),     # 영어 마침표
+            ('!', '! '),     # 영어 느낌표
+            ('?', '? '),     # 영어 물음표
+            (',', ', '),     # 쉼표 - 짧은 호흡
+            (':', ': '),     # 콜론 - 설명 전 휴지
+            (';', '; '),     # 세미콜론 - 문장 연결 휴지
+            (' - ', ' - '),  # 대시 - 강조나 설명 휴지
+            ('...', '... '), # 말줄임 - 자연스러운 여운
+        ]
+        
+        for old, new in pause_replacements:
+            text_with_pauses = text_with_pauses.replace(old, new)
+        
+        # 연속된 공백 정리
+        import re
+        text_with_pauses = re.sub(r'\s+', ' ', text_with_pauses)
+        
+        # 강사의 말하기 패턴을 고려한 문장 분할
+        # 마침표, 느낌표, 물음표를 기준으로 주요 구분점 설정
+        major_breaks = ['。 ', '！ ', '？ ', '. ', '! ', '? ']
+        sentences = [text_with_pauses]
+        
+        for break_mark in major_breaks:
+            new_sentences = []
+            for sentence in sentences:
+                parts = sentence.split(break_mark)
+                for i, part in enumerate(parts):
+                    if i < len(parts) - 1:  # 마지막이 아닌 경우
+                        new_sentences.append((part + break_mark).strip())
+                    elif part.strip():  # 마지막이면서 내용이 있는 경우
+                        new_sentences.append(part.strip())
+            sentences = [s for s in new_sentences if s]
         
         text_chunks = []
         current_chunk = ""
         
+        # 강사 영상 특성을 고려한 청크 크기 조정
+        # 움직임이 많고 핸드마이크 등으로 인한 음성 변화를 고려하여 
+        # 더 작은 청크로 분할하여 일관성 유지
+        adaptive_chunk_length = min(chunk_length, 300)  # 최대 300자로 제한
+        
         for sentence in sentences:
-            if len(current_chunk) + len(sentence) <= chunk_length:
-                current_chunk += sentence
+            # 문장이 너무 길면 의미 단위로 더 세분화
+            if len(sentence) > adaptive_chunk_length:
+                # 다양한 구분점을 활용한 세분화 (쉼표, 콜론, 세미콜론, 대시 등)
+                sub_delimiters = [', ', ': ', '; ', ' - ', ' and ', ' but ', ' so ', ' because ']
+                best_split = [sentence]  # 기본값
+                
+                # 가장 적절한 구분점 찾기
+                for delimiter in sub_delimiters:
+                    if delimiter in sentence:
+                        potential_split = sentence.split(delimiter)
+                        # 각 부분이 너무 작지 않고 적절한 크기인지 확인
+                        if all(20 <= len(part.strip()) <= adaptive_chunk_length for part in potential_split if part.strip()):
+                            best_split = [part.strip() + delimiter if i < len(potential_split)-1 else part.strip() 
+                                        for i, part in enumerate(potential_split) if part.strip()]
+                            break
+                
+                # 세분화된 문장들을 청크에 추가
+                for sub_sentence in best_split:
+                    if len(current_chunk) + len(sub_sentence) + 1 <= adaptive_chunk_length:
+                        if current_chunk:
+                            current_chunk += ' '
+                        current_chunk += sub_sentence
+                    else:
+                        if current_chunk:
+                            text_chunks.append(current_chunk.strip())
+                        current_chunk = sub_sentence
             else:
-                if current_chunk:
-                    text_chunks.append(current_chunk.strip())
-                current_chunk = sentence
+                # 적절한 크기의 문장은 그대로 추가
+                if len(current_chunk) + len(sentence) + 1 <= adaptive_chunk_length:
+                    if current_chunk:
+                        current_chunk += ' '
+                    current_chunk += sentence
+                else:
+                    if current_chunk:
+                        text_chunks.append(current_chunk.strip())
+                    current_chunk = sentence
         
         if current_chunk:
             text_chunks.append(current_chunk.strip())
         
-        # If text is short enough, process as single chunk
-        if len(text_chunks) <= 1:
-            text_chunks = [text]
+        # 매우 짧은 텍스트는 단일 청크로 처리하되, 휴지 정보는 유지
+        if len(text_chunks) <= 1 and len(text) < adaptive_chunk_length * 0.7:
+            text_chunks = [text_with_pauses]
+        
+        logger.info(f"📊 강사 영상 최적화 청킹 완료: {len(sentences)}개 문장 -> {len(text_chunks)}개 청크 (최대 {adaptive_chunk_length}자)")
     else:
         text_chunks = [text]
 
@@ -457,52 +542,111 @@ def generate_long(
             
             logger.info(f"🔄 Processing chunk {chunk_idx + 1}/{len(text_chunks)}")
             
-            # Add reference prompts for the first chunk
+            # Add reference prompts for the first chunk with MAXIMUM strength
             if chunk_idx == 0 and use_prompt and original_reference_texts is not None and original_reference_tokens is not None:
-                logger.info(f"📌 Adding original reference audio to first chunk")
+                logger.info(f"🔥 첫 번째 청크: MAXIMUM 원본 참조 오디오 강화")
                 for i, (t, c) in enumerate(zip(original_reference_texts, original_reference_tokens)):
-                    logger.info(f"  Adding reference {i+1}: text='{t[:30]}...' tokens_shape={c.shape}")
-                    base_content_sequence.append(
-                        [
-                            TextPart(text=t),
-                            VQPart(codes=c),
-                        ],
-                        add_end=True,
-                        speaker=0,
-                    )
-            
-            # For subsequent chunks, combine original reference with recent generated audio
-            elif chunk_idx > 0:
-                logger.info(f"🔗 Handling reference for chunk {chunk_idx + 1}")
-                
-                # Always include original reference to maintain voice consistency
-                if use_prompt and original_reference_tokens is not None and original_reference_texts is not None:
-                    logger.info(f"📌 Re-adding original reference audio for voice consistency")
-                    # Use only the first (most important) original reference
-                    main_ref_text = original_reference_texts[0]
-                    main_ref_tokens = original_reference_tokens[0]
+                    logger.info(f"  🎯 참조 {i+1} 추가: text='{t[:30]}...' tokens_shape={c.shape}")
                     
-                    # Truncate original reference if too long to save context
-                    if main_ref_tokens.shape[1] > 100:
-                        truncated_tokens = main_ref_tokens[:, :100]
-                        logger.info(f"  Using truncated original reference: {main_ref_tokens.shape} -> {truncated_tokens.shape}")
+                    # 참조 오디오 토큰을 최대한 많이 사용 (300 토큰까지)
+                    if c.shape[1] > 300:
+                        truncated_tokens = c[:, :300]
+                        logger.info(f"    참조 {i+1} 최대 활용: {c.shape} -> {truncated_tokens.shape}")
                     else:
-                        truncated_tokens = main_ref_tokens
-                        logger.info(f"  Using full original reference: {main_ref_tokens.shape}")
+                        truncated_tokens = c
+                        logger.info(f"    참조 {i+1} 전체 사용: {c.shape}")
                     
-                    base_content_sequence.append(
-                        [
-                            TextPart(text=main_ref_text),
-                            VQPart(codes=truncated_tokens),
-                        ],
-                        add_end=True,
-                        speaker=0,
-                    )
-                else:
-                    logger.info(f"⚠️ No original reference available for chunk {chunk_idx + 1} - voice may drift")
+                    # 첫 번째 청크에서도 참조를 3번 반복으로 극강 설정
+                    for repeat in range(3):  # 3번 반복으로 극강 참조
+                        base_content_sequence.append(
+                            [
+                                TextPart(text=t),
+                                VQPart(codes=truncated_tokens),
+                            ],
+                            add_end=True,
+                            speaker=0,
+                        )
+                        logger.info(f"    🔄 첫 청크 참조 {i+1} 극강화 반복 {repeat+1}/3")
+            
+            # For subsequent chunks, prioritize original reference for voice consistency
+            elif chunk_idx > 0:
+                logger.info(f"🔗 Handling reference for chunk {chunk_idx + 1} (강화된 목소리 일관성 모드)")
                 
-                # Note: Removed recent generated audio combination to prevent voice drift
-                logger.info(f"  ✅ Using ONLY original reference audio to prevent voice drift")
+                # ALWAYS include original reference to maintain voice consistency - this is the priority
+                if use_prompt and original_reference_tokens is not None and original_reference_texts is not None:
+                    logger.info(f"🔥 MAXIMUM 목소리 일관성 모드: 원본 참조 극대화")
+                    
+                    # 목소리 드리프트 방지를 위해 참조 오디오를 극도로 강화
+                    for i, (ref_text, ref_tokens) in enumerate(zip(original_reference_texts, original_reference_tokens)):
+                        # 참조 오디오 토큰을 최대한 많이 사용 (300 토큰까지 확장)
+                        if ref_tokens.shape[1] > 300:
+                            truncated_tokens = ref_tokens[:, :300]
+                            logger.info(f"  🎯 참조 {i+1} 사용 (최대 활용): {ref_tokens.shape} -> {truncated_tokens.shape}")
+                        else:
+                            truncated_tokens = ref_tokens
+                            logger.info(f"  🎯 참조 {i+1} 전체 사용: {ref_tokens.shape}")
+                        
+                        # 목소리 일관성을 위해 참조를 3번 반복 삽입 (더 강력한 영향)
+                        for repeat in range(3):  # 3번 반복으로 극강 참조
+                            base_content_sequence.append(
+                                [
+                                    TextPart(text=ref_text),
+                                    VQPart(codes=truncated_tokens),
+                                ],
+                                add_end=True,
+                                speaker=0,
+                            )
+                            logger.info(f"    🔄 참조 {i+1} 강화 반복 {repeat+1}/3")
+                    
+                    # Store reference token count for logging  
+                    ref_token_count = sum(min(tokens.shape[1], 300) for tokens in original_reference_tokens) * 3  # 3배 반영
+                    logger.info(f"  📊 총 참조 토큰 수: {ref_token_count} (극대화됨)")
+                else:
+                    ref_token_count = 0
+                
+                # 목소리 드리프트 방지를 위해 이전 생성 오디오 사용을 극도로 제한
+                # 원본 참조 오디오가 압도적으로 우선하도록 설정
+                if len(all_codes) > 0 and chunk_idx <= 2:  # 처음 2-3개 청크에서만 제한적 사용
+                    prev_codes = all_codes[-1].cpu()
+                    logger.info(f"  이전 생성 코드 형태: {prev_codes.shape}")
+                    
+                    if len(prev_codes.shape) == 2 and prev_codes.shape[1] > 10:
+                        # 목소리 드리프트 방지를 위해 전환 세그먼트를 극도로 축소
+                        # 참조 오디오 대비 비율을 1:20 이하로 유지 (5% 이하)
+                        max_transition_length = min(3, max(1, ref_token_count // 100))  # 참조의 1% 이하
+                        
+                        if max_transition_length >= 2:
+                            start_idx = max(0, prev_codes.shape[1] - max_transition_length - 1)
+                            end_idx = prev_codes.shape[1] - 1
+                            
+                            transition_codes = prev_codes[:, start_idx:end_idx]
+                            
+                            logger.info(f"  🔒 극소량 전환 세그먼트: {transition_codes.shape} (최대: {max_transition_length})")
+                            logger.info(f"  🎯 전환/참조 비율: {transition_codes.shape[1]}/{ref_token_count} = {transition_codes.shape[1]/ref_token_count*100:.1f}% (극소)")
+                            
+                            # 매우 엄격한 조건으로만 사용
+                            if transition_codes.shape[1] >= 1 and transition_codes.shape[1] <= 3:
+                                base_content_sequence.append(
+                                    [
+                                        VQPart(codes=transition_codes),
+                                    ],
+                                    add_end=True,
+                                    speaker=0,
+                                )
+                                logger.info(f"    ✅ 극소량 전환 적용 (목소리 드리프트 최소화)")
+                            else:
+                                logger.info(f"  ❌ 전환 세그먼트 거부: 목소리 일관성 우선")
+                        else:
+                            logger.info(f"  ❌ 전환 길이 부족: 원본 참조만 사용")
+                    else:
+                        logger.info(f"  ❌ 이전 코드 부족: 원본 참조만 사용")
+                else:
+                    if chunk_idx > 2:
+                        logger.info(f"  🚫 청크 {chunk_idx+1}: 이전 오디오 사용 금지 (목소리 드리프트 방지)")
+                    else:
+                        logger.info(f"  ⚠️ 첫 청크: 이전 코드 없음")
+                
+                logger.info(f"  🎯 원본 참조 절대 우선 모드 활성화")
             
             base_content_sequence.append(
                 [
@@ -518,29 +662,132 @@ def generate_long(
             
             logger.info(f"  Encoded sequence length: {encoded.size(1)}")
             
-            if encoded.size(1) > max_length - 2048:
-                logger.warning(f"  Chunk {chunk_idx} too long: {encoded.size(1)} > {max_length - 2048}, truncating")
-                encoded = encoded[:, :max_length - 2048]
-                audio_masks = audio_masks[:max_length - 2048]
+            # 긴 텍스트 처리를 위해 컨텍스트 제한을 완화
+            # 기존 2048 여유분을 1024로 줄여 더 많은 텍스트 처리 가능
+            context_buffer = 1024
+            if encoded.size(1) > max_length - context_buffer:
+                logger.warning(f"  Chunk {chunk_idx} too long: {encoded.size(1)} > {max_length - context_buffer}, truncating")
+                # 텍스트 부분을 우선적으로 보존하고 오디오 참조 부분을 축소
+                if chunk_idx > 0:  # 첫 번째 청크가 아닌 경우
+                    # 텍스트 토큰 길이 추정 (대략적으로)
+                    text_token_estimate = len(chunk_text) // 2  # 한 글자당 약 0.5 토큰
+                    min_required = text_token_estimate + context_buffer
+                    
+                    if encoded.size(1) > min_required:
+                        # 오디오 참조 부분을 더 많이 축소
+                        new_length = max(min_required, max_length - context_buffer // 2)
+                        logger.info(f"    Preserving text context: truncating to {new_length} (estimated text tokens: {text_token_estimate})")
+                    else:
+                        new_length = max_length - context_buffer
+                else:
+                    new_length = max_length - context_buffer
+                
+                encoded = encoded[:, :new_length]
+                audio_masks = audio_masks[:new_length]
                 if audio_parts is not None:
-                    audio_parts = audio_parts[:max_length - 2048]
+                    audio_parts = audio_parts[:new_length]
 
             encoded = encoded.to(device=device)
             logger.info(f"🎬 Generating audio for chunk {chunk_idx + 1}: '{chunk_text[:50]}...'")
 
             prompt_length = encoded.size(1)
 
+            # 목소리 일관성 최우선 - 보수적 파라미터로 안정성 확보
+            # 랜덤성을 줄이고 참조 오디오의 영향력을 극대화
+            
+            # Temperature 조정: 목소리 드리프트 방지를 위해 더 보수적으로 설정
+            try:
+                base_temp = float(temperature.item())
+            except (AttributeError, TypeError):
+                base_temp = float(temperature)
+            
+            # 목소리 일관성을 위해 temperature를 낮춤 (랜덤성 감소)
+            # 청크 간 변화를 최소화하여 동일한 목소리 유지
+            if chunk_idx == 0:
+                # 첫 청크: 참조 오디오와 최대한 유사하게
+                chunk_temperature = torch.tensor(
+                    max(0.6, min(0.8, base_temp - 0.1)), 
+                    device=device, dtype=torch.float
+                )
+                temp_val = chunk_temperature.item() if hasattr(chunk_temperature, 'item') else float(chunk_temperature)
+                logger.info(f"  🎯 첫 청크: 보수적 temperature = {temp_val:.3f} (참조 우선)")
+            else:
+                # 후속 청크: 일관성 유지를 위해 더욱 보수적
+                chunk_temperature = torch.tensor(
+                    max(0.5, min(0.7, base_temp - 0.2)), 
+                    device=device, dtype=torch.float
+                )
+                temp_val = chunk_temperature.item() if hasattr(chunk_temperature, 'item') else float(chunk_temperature)
+                logger.info(f"  🔒 청크 {chunk_idx+1}: 극보수적 temperature = {temp_val:.3f} (일관성 우선)")
+            
+            # Repetition penalty 조정: 목소리 특성 유지를 위해 적당히 설정
+            try:
+                base_rep_penalty = float(repetition_penalty.item())
+            except (AttributeError, TypeError):
+                base_rep_penalty = float(repetition_penalty)
+            
+            # 목소리 일관성을 위해 repetition penalty를 적절히 조정
+            chunk_repetition_penalty = torch.tensor(
+                max(1.02, min(1.08, base_rep_penalty)), 
+                device=device, dtype=torch.float
+            )
+            
+            logger.info(f"  🎛️ 목소리 일관성 우선 파라미터 적용 완료")
+            chunk_temp_value = chunk_temperature.item() if hasattr(chunk_temperature, 'item') else float(chunk_temperature)
+            chunk_rep_value = chunk_repetition_penalty.item() if hasattr(chunk_repetition_penalty, 'item') else float(chunk_repetition_penalty)
+            temp_change = chunk_temp_value - base_temp
+            rep_change = chunk_rep_value - base_rep_penalty
+            logger.info(f"    Temperature: {base_temp:.3f} -> {chunk_temp_value:.3f} (변화: {temp_change:+.3f})")
+            logger.info(f"    Rep_penalty: {base_rep_penalty:.3f} -> {chunk_rep_value:.3f} (변화: {rep_change:+.3f})")
+            
+            # 목소리 일관성을 위한 보수적 토큰 수 조정
+            if max_new_tokens == 0:
+                # 텍스트 특성에 따른 적응적 토큰 수 계산 (더 보수적)
+                text_length = len(chunk_text)
+                
+                # 문장 부호 개수로 호흡점 파악
+                pause_marks = chunk_text.count('.') + chunk_text.count('!') + chunk_text.count('?') + \
+                             chunk_text.count(',') + chunk_text.count(':') + chunk_text.count(';')
+                
+                # 목소리 일관성을 위해 더 보수적인 토큰 비율 사용
+                base_token_ratio = 2.0  # 2.2에서 2.0으로 축소하여 더 안정적
+                
+                # 호흡점 보너스도 축소하여 일관성 우선
+                pause_bonus = min(pause_marks * 0.05, 0.3)  # 0.1에서 0.05로, 최대 0.5에서 0.3으로 축소
+                adjusted_ratio = base_token_ratio + pause_bonus
+                
+                estimated_tokens = int(text_length * adjusted_ratio)
+                
+                # 청크 크기에 따른 더 보수적인 범위 설정 (목소리 드리프트 방지)
+                if text_length < 50:  # 짧은 청크
+                    min_tokens, max_tokens = 100, 300  # 축소
+                elif text_length < 150:  # 중간 청크
+                    min_tokens, max_tokens = 150, 600  # 축소
+                else:  # 긴 청크
+                    min_tokens, max_tokens = 200, 800  # 축소
+                
+                dynamic_max_tokens = max(min_tokens, min(estimated_tokens, max_tokens))
+                
+                logger.info(f"  🎯 목소리 일관성 우선 토큰 수 조정:")
+                logger.info(f"    텍스트 길이: {text_length}, 호흡점: {pause_marks}개")
+                logger.info(f"    보수적 토큰 비율: {base_token_ratio} + {pause_bonus:.2f} = {adjusted_ratio:.2f}")
+                logger.info(f"    최종 토큰 수: {dynamic_max_tokens} (범위: {min_tokens}-{max_tokens}, 일관성 우선)")
+            else:
+                dynamic_max_tokens = max_new_tokens
+            
+            logger.info(f"  Generation parameters: temp={chunk_temperature:.3f}, rep_penalty={chunk_repetition_penalty:.3f}, max_tokens={dynamic_max_tokens}")
+
             t0 = time.perf_counter()
             y = generate(
                 model=model,
                 prompt=encoded,
-                max_new_tokens=max_new_tokens,
+                max_new_tokens=dynamic_max_tokens,  # 동적으로 계산된 토큰 수 사용
                 audio_masks=audio_masks,
                 audio_parts=audio_parts,
                 decode_one_token=decode_one_token,
-                temperature=temperature,
+                temperature=chunk_temperature,
                 top_p=top_p,
-                repetition_penalty=repetition_penalty,
+                repetition_penalty=chunk_repetition_penalty,
             )
 
             if sample_idx == 0 and chunk_idx == 0 and compile:
@@ -696,7 +943,7 @@ def main(
     os.makedirs(output_dir, exist_ok=True)
     precision = torch.half if half else torch.bfloat16
 
-    if prompt_text is not None and len(prompt_text) != len(prompt_tokens):
+    if prompt_text is not None and prompt_tokens is not None and len(prompt_text) != len(prompt_tokens):
         raise ValueError(
             f"Number of prompt text ({len(prompt_text)}) and prompt tokens ({len(prompt_tokens)}) should be the same"
         )
