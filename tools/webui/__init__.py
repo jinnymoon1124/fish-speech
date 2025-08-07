@@ -22,7 +22,7 @@ def build_app(inference_fct: Callable, theme: str = "light") -> gr.Blocks:
         with gr.Row():
             with gr.Column(scale=3):
                 text = gr.Textbox(
-                    label=i18n("Input Text"), placeholder=TEXTBOX_PLACEHOLDER, lines=10
+                    label=i18n("Input Text"), placeholder=TEXTBOX_PLACEHOLDER, lines=10,
                 )
 
                 with gr.Row():

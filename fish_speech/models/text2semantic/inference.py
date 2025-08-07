@@ -844,6 +844,13 @@ def generate_long(
         original_reference_texts = list(prompt_text) if prompt_text else None
         tokens_sec = None  # Initialize to track token generation speed
         
+        # 🎯 청크 간 음성 연속성을 위한 이전 생성 오디오 저장소
+        previous_generated_tokens = []  # 이전 청크에서 생성된 오디오 토큰들
+        previous_generated_texts = []   # 이전 청크의 텍스트들
+        
+        # 🔗 텍스트 오버랩을 통한 연속성 강화를 위한 설정
+        text_overlap_words = 5  # 이전 청크의 마지막 5단어를 다음 청크 시작에 추가
+        
         logger.info(f"🎯 Starting sample {sample_idx + 1}/{num_samples}")
         
         # Process each chunk
@@ -852,6 +859,27 @@ def generate_long(
             max_length = model.config.max_seq_len
             
             logger.info(f"🔄 Processing chunk {chunk_idx + 1}/{len(text_chunks)}")
+            
+            # 🔗 텍스트 연속성을 위한 컨텍스트 준비 (오버랩은 참조용으로만 사용)
+            original_chunk_text = chunk_text
+            overlap_context_text = ""  # 오버랩 컨텍스트 (참조용)
+            
+            if chunk_idx > 0 and len(previous_generated_texts) > 0:
+                # 이전 청크의 마지막 몇 단어를 컨텍스트로만 준비 (실제 생성에는 포함하지 않음)
+                prev_text = previous_generated_texts[-1]
+                prev_words = prev_text.split()
+                
+                if len(prev_words) >= text_overlap_words:
+                    overlap_context_text = " ".join(prev_words[-text_overlap_words:])
+                    logger.info(f"  🔗 연속성 컨텍스트 준비: '{overlap_context_text}' (참조용만, 음성 생성 제외)")
+                    logger.info(f"    실제 생성 텍스트: '{original_chunk_text[:50]}...'")
+                else:
+                    logger.info(f"  ℹ️ 이전 청크가 너무 짧아 컨텍스트 미적용 (단어 수: {len(prev_words)} < {text_overlap_words})")
+            else:
+                logger.info(f"  ℹ️ 첫 번째 청크 - 연속성 컨텍스트 미적용")
+            
+            # 실제 음성 생성에는 원본 텍스트만 사용
+            chunk_text_for_generation = original_chunk_text
             
             # Add reference prompts for the first chunk with MAXIMUM strength
             if chunk_idx == 0 and use_prompt and original_reference_texts is not None and original_reference_tokens is not None:
@@ -895,15 +923,15 @@ def generate_long(
                     
                     # 🎯 강사 영상 최적화: 극대화된 참조 반복으로 목소리 일관성 확보
                     # 모든 청크에서 충분한 참조 반복으로 일관된 목소리 유지
-                    base_repeat_count = 8  # 기본 8회 반복 (3회에서 대폭 증가)
-                    drift_prevention_bonus = min(chunk_idx, 4)  # 최대 4회 추가 (총 최대 12회)
+                    base_repeat_count = 6  # 8회에서 6회로 줄여서 이전 오디오 공간 확보
+                    drift_prevention_bonus = min(chunk_idx, 3)  # 최대 3회 추가 (총 최대 9회)
                     total_repeat_count = base_repeat_count + drift_prevention_bonus
                     
                     logger.info(f"  📈 청크 {chunk_idx+1} 드리프트 방지 강화: 기본 {base_repeat_count}회 + 보너스 {drift_prevention_bonus}회 = 총 {total_repeat_count}회")
                     
                     for i, (ref_text, ref_tokens) in enumerate(zip(original_reference_texts, original_reference_tokens)):
-                        # 참조 오디오 토큰을 최대한 많이 사용 (350 토큰까지 확장)
-                        max_tokens = 350  # 300에서 350으로 증가
+                        # 참조 오디오 토큰을 최대한 많이 사용 (300 토큰으로 조정)
+                        max_tokens = 300  # 350에서 300으로 조정하여 이전 오디오 공간 확보
                         if ref_tokens.shape[1] > max_tokens:
                             truncated_tokens = ref_tokens[:, :max_tokens]
                             logger.info(f"  🎯 참조 {i+1} 사용 (최대 활용): {ref_tokens.shape} -> {truncated_tokens.shape}")
@@ -927,24 +955,73 @@ def generate_long(
                                 logger.info(f"    🛡️ 참조 {i+1} 드리프트 방지 추가 반복 {repeat+1}/{total_repeat_count}")
                     
                     # 드리프트 방지를 위한 참조 토큰 수 계산
-                    ref_token_count = sum(min(tokens.shape[1], 350) for tokens in original_reference_tokens) * total_repeat_count
+                    ref_token_count = sum(min(tokens.shape[1], 300) for tokens in original_reference_tokens) * total_repeat_count
                     logger.info(f"  📊 총 참조 토큰 수: {ref_token_count} (드리프트 방지 강화됨)")
                 else:
                     ref_token_count = 0
                 
-                # 🚫 목소리 드리프트 완전 차단: 이전 생성 오디오 사용 금지
-                # 모든 청크에서 오직 원본 참조 오디오만 사용하여 100% 일관성 확보
-                logger.info(f"  🚫 청크 {chunk_idx+1}: 이전 생성 오디오 완전 차단")
-                logger.info(f"  🎯 원본 참조 오디오 100% 의존 모드")
-                logger.info(f"  💪 목소리 드리프트 제로 정책 적용")
+                # 🎯 NEW: 청크 간 음성 연속성을 위한 이전 생성 오디오 활용
+                # 이전 청크의 마지막 부분을 현재 청크의 추가 참조로 사용
+                if chunk_idx > 0 and len(previous_generated_tokens) > 0:
+                    logger.info(f"🔗 청크 {chunk_idx+1}: 이전 생성 오디오로 연속성 확보")
+                    
+                    # 가장 최근 생성된 오디오를 우선적으로 사용 (최대 2개)
+                    recent_count = min(2, len(previous_generated_tokens))
+                    
+                    for i in range(recent_count):
+                        prev_idx = len(previous_generated_tokens) - 1 - i  # 최신 것부터
+                        prev_tokens = previous_generated_tokens[prev_idx]
+                        prev_text = previous_generated_texts[prev_idx]
+                        
+                        # 이전 오디오의 뒷부분만 사용 (자연스러운 연결을 위해)
+                        # 너무 길면 마지막 150 토큰만 사용
+                        if prev_tokens.shape[1] > 150:
+                            connection_tokens = prev_tokens[:, -150:]
+                            logger.info(f"  🔗 이전 청크 {prev_idx+1} 연결 토큰: {prev_tokens.shape} -> {connection_tokens.shape} (마지막 150토큰)")
+                        else:
+                            connection_tokens = prev_tokens
+                            logger.info(f"  🔗 이전 청크 {prev_idx+1} 연결 토큰: 전체 사용 {connection_tokens.shape}")
+                        
+                        # 이전 텍스트의 마지막 부분 (연결 컨텍스트용)
+                        prev_text_words = prev_text.split()
+                        if len(prev_text_words) > 10:
+                            connection_text = " ".join(prev_text_words[-10:])  # 마지막 10단어
+                        else:
+                            connection_text = prev_text
+                        
+                        # 현재 청크와의 연결을 위해 오버랩 컨텍스트 추가 (있는 경우)
+                        if overlap_context_text:
+                            connection_text = connection_text + " " + overlap_context_text
+                            logger.info(f"  🔗 연결 컨텍스트에 오버랩 추가: '{connection_text[-50:]}'...")
+                        
+                        # 연결성 강화를 위해 2회 반복 (원본 참조보다는 적게)
+                        for repeat in range(2):
+                            base_content_sequence.append(
+                                [
+                                    TextPart(text=connection_text),
+                                    VQPart(codes=connection_tokens),
+                                ],
+                                add_end=True,
+                                speaker=0,
+                            )
+                            logger.info(f"    🔄 연결 참조 {i+1} 반복 {repeat+1}/2: '{connection_text[:30]}...'")
+                    
+                    logger.info(f"  ✅ 청크 연속성 참조 추가 완료: {recent_count}개 이전 청크 활용")
+                else:
+                    logger.info(f"  ℹ️ 청크 {chunk_idx+1}: 첫 번째 청크이거나 이전 오디오 없음 - 원본 참조만 사용")
             
+            # 🎯 실제 음성 생성에는 원본 텍스트만 사용 (오버랩 제외)
             base_content_sequence.append(
                 [
-                    TextPart(text=chunk_text),
+                    TextPart(text=chunk_text_for_generation),
                 ],
                 add_end=False,
                 speaker=0,
             )
+            
+            logger.info(f"  📝 실제 생성 텍스트: '{chunk_text_for_generation[:100]}{'...' if len(chunk_text_for_generation) > 100 else ''}'")
+            if overlap_context_text:
+                logger.info(f"  🔗 참조 컨텍스트 (생성 제외): '{overlap_context_text}'")
 
             encoded, audio_masks, audio_parts = base_content_sequence.encode_for_inference(
                 tokenizer, num_codebooks=model.config.num_codebooks
@@ -978,7 +1055,7 @@ def generate_long(
                     audio_parts = audio_parts[:new_length]
 
             encoded = encoded.to(device=device)
-            logger.info(f"🎬 Generating audio for chunk {chunk_idx + 1}: '{chunk_text[:50]}...'")
+            logger.info(f"🎬 Generating audio for chunk {chunk_idx + 1}: '{chunk_text_for_generation[:50]}...'")
 
             prompt_length = encoded.size(1)
 
@@ -994,8 +1071,8 @@ def generate_long(
             except (AttributeError, TypeError):
                 base_temp = float(temperature)
             
-            # 텍스트 특성 분석을 통한 동적 temperature 조정
-            chunk_words = chunk_text.split()
+            # 텍스트 특성 분석을 통한 동적 temperature 조정 (원본 텍스트 기준)
+            chunk_words = chunk_text_for_generation.split()
             
             # 반복 위험도 계산
             repetition_risk = 0.0
@@ -1042,7 +1119,7 @@ def generate_long(
             target_temp = 0.7  # 안정적이고 자연스러운 고정 temperature
             
             chunk_temperature = torch.tensor(target_temp, device=device, dtype=torch.float)
-            temp_val = chunk_temperature.item() if hasattr(chunk_temperature, 'item') else float(chunk_temperature)
+            temp_val = float(chunk_temperature.item()) if hasattr(chunk_temperature, 'item') else float(chunk_temperature)
             logger.info(f"  🎯 청크 {chunk_idx+1}: 일관성 우선 temperature = {temp_val:.3f} (고정값)")
             logger.info(f"    반복 위험도: {repetition_risk:.3f} (참고용, 조정 안함)")
             
@@ -1059,25 +1136,25 @@ def generate_long(
             # 기본값 그대로 사용하여 일관성 유지
             chunk_repetition_penalty = torch.tensor(base_rep_penalty, device=device, dtype=torch.float)
             
-            rep_val = chunk_repetition_penalty.item() if hasattr(chunk_repetition_penalty, 'item') else float(chunk_repetition_penalty)
+            rep_val = float(chunk_repetition_penalty.item()) if hasattr(chunk_repetition_penalty, 'item') else float(chunk_repetition_penalty)
             logger.info(f"  🎛️ 일관성 우선 repetition penalty = {rep_val:.3f} (고정값, 반복위험도 무시)")
             
             logger.info(f"  🎛️ 목소리 일관성 우선 파라미터 적용 완료")
-            chunk_temp_value = chunk_temperature.item() if hasattr(chunk_temperature, 'item') else float(chunk_temperature)
-            chunk_rep_value = chunk_repetition_penalty.item() if hasattr(chunk_repetition_penalty, 'item') else float(chunk_repetition_penalty)
+            chunk_temp_value = float(chunk_temperature.item()) if hasattr(chunk_temperature, 'item') else float(chunk_temperature)
+            chunk_rep_value = float(chunk_repetition_penalty.item()) if hasattr(chunk_repetition_penalty, 'item') else float(chunk_repetition_penalty)
             temp_change = float(chunk_temp_value) - float(base_temp)
             rep_change = float(chunk_rep_value) - float(base_rep_penalty)
             logger.info(f"    Temperature: {base_temp:.3f} -> {chunk_temp_value:.3f} (변화: {temp_change:+.3f})")
             logger.info(f"    Rep_penalty: {base_rep_penalty:.3f} -> {chunk_rep_value:.3f} (변화: {rep_change:+.3f})")
             
-            # 목소리 일관성을 위한 보수적 토큰 수 조정
+            # 목소리 일관성을 위한 보수적 토큰 수 조정 (원본 텍스트 기준)
             if max_new_tokens == 0:
                 # 텍스트 특성에 따른 적응적 토큰 수 계산 (더 보수적)
-                text_length = len(chunk_text)
+                text_length = len(chunk_text_for_generation)
                 
-                # 문장 부호 개수로 호흡점 파악
-                pause_marks = chunk_text.count('.') + chunk_text.count('!') + chunk_text.count('?') + \
-                             chunk_text.count(',') + chunk_text.count(':') + chunk_text.count(';')
+                # 문장 부호 개수로 호흡점 파악 (원본 텍스트 기준)
+                pause_marks = chunk_text_for_generation.count('.') + chunk_text_for_generation.count('!') + chunk_text_for_generation.count('?') + \
+                             chunk_text_for_generation.count(',') + chunk_text_for_generation.count(':') + chunk_text_for_generation.count(';')
                 
                 # 텍스트 완전성을 위한 충분한 토큰 비율 사용 (끊김 방지)
                 base_token_ratio = 2.5  # 2.0에서 2.5로 증가하여 완전성 우선
@@ -1085,9 +1162,9 @@ def generate_long(
                 # 호흡점과 복잡성을 고려한 보너스 증가
                 pause_bonus = min(pause_marks * 0.08, 0.5)  # 0.05에서 0.08로, 최대 0.5로 증가
                 
-                # 문장 복잡성 분석 (접속사, 관계대명사 등)
+                # 문장 복잡성 분석 (접속사, 관계대명사 등) - 원본 텍스트 기준
                 complexity_words = ['and', 'but', 'because', 'when', 'if', 'that', 'which', 'who', 'where', 'how']
-                complexity_count = sum(chunk_text.lower().count(word) for word in complexity_words)
+                complexity_count = sum(chunk_text_for_generation.lower().count(word) for word in complexity_words)
                 complexity_bonus = min(complexity_count * 0.05, 0.3)
                 
                 adjusted_ratio = base_token_ratio + pause_bonus + complexity_bonus
@@ -1114,11 +1191,11 @@ def generate_long(
             else:
                 dynamic_max_tokens = max_new_tokens
             
-            # 반복 패턴 감지를 위한 청크 컨텍스트 정보 로깅
+            # 반복 패턴 감지를 위한 청크 컨텍스트 정보 로깅 (원본 텍스트 기준)
             logger.info(f"  📝 청크 {chunk_idx+1} 텍스트 컨텍스트:")
-            logger.info(f"    📄 텍스트 내용: '{chunk_text[:100]}{'...' if len(chunk_text) > 100 else ''}'")
-            logger.info(f"    📏 텍스트 길이: {len(chunk_text)}자")
-            logger.info(f"    🔤 단어 수: {len(chunk_text.split())}개")
+            logger.info(f"    📄 텍스트 내용: '{chunk_text_for_generation[:100]}{'...' if len(chunk_text_for_generation) > 100 else ''}'")
+            logger.info(f"    📏 텍스트 길이: {len(chunk_text_for_generation)}자")
+            logger.info(f"    🔤 단어 수: {len(chunk_text_for_generation.split())}개")
             
             logger.info(f"  🎛️ 드리프트 방지 생성 파라미터:")
             logger.info(f"    - Temperature: {chunk_temperature:.3f} (청크 {chunk_idx+1})")
@@ -1138,7 +1215,7 @@ def generate_long(
                 temperature=chunk_temperature,
                 top_p=top_p,
                 repetition_penalty=chunk_repetition_penalty,
-                text_context=chunk_text,  # 반복 패턴 추적을 위한 텍스트 컨텍스트
+                text_context=chunk_text_for_generation,  # 반복 패턴 추적을 위한 텍스트 컨텍스트 (원본 텍스트)
                 chunk_idx=chunk_idx,      # 청크 인덱스
             )
 
@@ -1173,8 +1250,22 @@ def generate_long(
             # But for global encoding, we should keep the <im_end> token
             global_encoded.append(decoded.cpu())
             
+            # 🎯 NEW: 생성된 오디오를 다음 청크의 연속성을 위해 저장
+            # 각 청크에서 생성된 오디오 토큰과 텍스트를 저장하여 다음 청크에서 참조로 활용
+            previous_generated_tokens.append(codes.cpu())  # CPU로 이동하여 메모리 절약
+            # 원본 텍스트를 저장 (오버랩이 적용된 텍스트가 아닌)
+            previous_generated_texts.append(original_chunk_text)
+            
+            # 메모리 관리: 최대 3개의 이전 청크만 유지 (너무 많으면 메모리 부족)
+            if len(previous_generated_tokens) > 3:
+                previous_generated_tokens.pop(0)  # 가장 오래된 것 제거
+                previous_generated_texts.pop(0)
+                logger.info(f"  🗑️ 메모리 관리: 오래된 청크 참조 제거 (최대 3개 유지)")
+            
+            logger.info(f"  💾 청크 {chunk_idx+1} 저장 완료: 다음 청크 연속성을 위해 보관 (총 {len(previous_generated_tokens)}개 저장)")
+            
             assert (codes >= 0).all(), f"Negative code found: {codes}"
-            yield GenerateResponse(action="sample", codes=codes, text=chunk_text)
+            yield GenerateResponse(action="sample", codes=codes, text=original_chunk_text)
 
         # Log total statistics
         total_tokens = sum(codes.size(1) for codes in all_codes)
