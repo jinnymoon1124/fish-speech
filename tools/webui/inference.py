@@ -10,26 +10,57 @@ import soundfile as sf
 from fish_speech.i18n import i18n
 from fish_speech.utils.schema import ServeReferenceAudio, ServeTTSRequest
 
-MAX_CHARS_PER_CHUNK = 200
+MAX_CHARS_PER_CHUNK = 400
+PAUSE_SENTENCE = 0.4   # pause after sentence-ending punctuation (.!?。！？)
+PAUSE_COMMA = 0.15     # pause after commas (,，、)
 
 
-def split_text(text: str) -> list[str]:
-    """Split long text into chunks by sentences, respecting a max character limit."""
-    sentences = re.split(r'(?<=[.!?。！？\n])\s*', text.strip())
-    sentences = [s.strip() for s in sentences if s.strip()]
+def split_text(text: str) -> list[tuple[str, str]]:
+    """Split text at punctuation marks, returning (chunk, separator_type) pairs.
 
-    chunks = []
-    current = ""
-    for sent in sentences:
-        if current and len(current) + len(sent) > MAX_CHARS_PER_CHUNK:
-            chunks.append(current.strip())
-            current = sent
+    separator_type is 'sentence', 'comma', or 'none' (for the last chunk).
+    """
+    # Split at sentence-enders and commas, keeping the delimiter
+    parts = re.split(r'([.!?。！？\n]+|[,，、]+)', text.strip())
+
+    # Rebuild segments: pair each text part with its trailing punctuation type
+    segments = []
+    i = 0
+    while i < len(parts):
+        chunk = parts[i].strip()
+        if i + 1 < len(parts):
+            sep = parts[i + 1]
+            chunk += sep  # keep punctuation in the text
+            if re.match(r'[.!?。！？\n]+', sep):
+                sep_type = "sentence"
+            else:
+                sep_type = "comma"
+            i += 2
         else:
-            current = current + " " + sent if current else sent
-    if current.strip():
-        chunks.append(current.strip())
+            sep_type = "none"
+            i += 1
+        if chunk.strip():
+            segments.append((chunk.strip(), sep_type))
 
-    return chunks if chunks else [text]
+    if not segments:
+        return [(text, "none")]
+
+    # Merge small segments to stay within MAX_CHARS_PER_CHUNK
+    merged = []
+    current_text = ""
+    current_sep = "none"
+    for chunk, sep_type in segments:
+        if current_text and len(current_text) + len(chunk) > MAX_CHARS_PER_CHUNK:
+            merged.append((current_text.strip(), current_sep))
+            current_text = chunk
+            current_sep = sep_type
+        else:
+            current_text = current_text + " " + chunk if current_text else chunk
+            current_sep = sep_type
+    if current_text.strip():
+        merged.append((current_text.strip(), current_sep))
+
+    return merged if merged else [(text, "none")]
 
 
 def audio_to_reference(audio_data: np.ndarray, sample_rate: int, text: str) -> list:
@@ -65,10 +96,10 @@ def inference_wrapper(
         references = []
 
     chunks = split_text(text)
-    all_segments = []
+    all_segments = []  # list of (audio_data, sep_type) pairs
     sample_rate = None
 
-    for i, chunk in enumerate(chunks):
+    for i, (chunk, sep_type) in enumerate(chunks):
         req = ServeTTSRequest(
             text=chunk,
             reference_id=reference_id if reference_id else None,
@@ -86,7 +117,7 @@ def inference_wrapper(
             match result.code:
                 case "final":
                     sample_rate, audio_data = result.audio
-                    all_segments.append(audio_data)
+                    all_segments.append((audio_data, sep_type))
                     # Use first chunk's audio as reference for remaining chunks
                     if i == 0 and not references and not reference_id:
                         references = audio_to_reference(audio_data, sample_rate, chunk)
@@ -98,7 +129,22 @@ def inference_wrapper(
     if not all_segments:
         return None, i18n("No audio generated")
 
-    combined = np.concatenate(all_segments, axis=0)
+    if sample_rate and len(all_segments) > 1:
+        parts = [all_segments[0][0]]
+        for j in range(1, len(all_segments)):
+            prev_sep = all_segments[j - 1][1]
+            if prev_sep == "sentence":
+                pause = PAUSE_SENTENCE
+            elif prev_sep == "comma":
+                pause = PAUSE_COMMA
+            else:
+                pause = PAUSE_COMMA
+            parts.append(np.zeros(int(sample_rate * pause)))
+            parts.append(all_segments[j][0])
+        combined = np.concatenate(parts, axis=0)
+    else:
+        combined = np.concatenate([s[0] for s in all_segments], axis=0)
+
     return (sample_rate, combined), None
 
 
