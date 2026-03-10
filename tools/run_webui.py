@@ -104,4 +104,4 @@ if __name__ == "__main__":
     inference_fct = get_inference_wrapper(inference_engine)
 
     app = build_app(inference_fct, args.theme)
-    app.launch()
+    app.launch(server_name="0.0.0.0")

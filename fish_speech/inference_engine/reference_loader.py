@@ -31,9 +31,12 @@ class ReferenceLoader:
         self.encode_reference: Callable
 
         # Define the torchaudio backend
-        backends = torchaudio.list_audio_backends()
-        if "ffmpeg" in backends:
-            self.backend = "ffmpeg"
+        if hasattr(torchaudio, "list_audio_backends"):
+            backends = torchaudio.list_audio_backends()
+            if "ffmpeg" in backends:
+                self.backend = "ffmpeg"
+            else:
+                self.backend = "soundfile"
         else:
             self.backend = "soundfile"
 
@@ -114,7 +117,19 @@ class ReferenceLoader:
             audio_data = reference_audio
             reference_audio = io.BytesIO(audio_data)
 
-        waveform, original_sr = torchaudio.load(reference_audio, backend=self.backend)
+        try:
+            waveform, original_sr = torchaudio.load(reference_audio, backend=self.backend)
+        except (ImportError, TypeError):
+            import soundfile as sf
+            import numpy as np
+            if isinstance(reference_audio, io.BytesIO):
+                reference_audio.seek(0)
+            data, original_sr = sf.read(reference_audio)
+            if data.ndim == 1:
+                data = data[np.newaxis, :]
+            else:
+                data = data.T
+            waveform = torch.from_numpy(data).float()
 
         if waveform.shape[0] > 1:
             waveform = torch.mean(waveform, dim=0, keepdim=True)
