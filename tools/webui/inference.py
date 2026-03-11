@@ -11,8 +11,8 @@ from fish_speech.i18n import i18n
 from fish_speech.utils.schema import ServeReferenceAudio, ServeTTSRequest
 
 MAX_CHARS_PER_CHUNK = 400
-PAUSE_SENTENCE = 0.4   # pause after sentence-ending punctuation (.!?。！？)
-PAUSE_COMMA = 0.15     # pause after commas (,，、)
+PAUSE_SENTENCE = 0.7   # pause after sentence-ending punctuation (.!?。！？)
+PAUSE_COMMA = 0.35     # pause after commas (,，、)
 
 
 def split_text(text: str) -> list[tuple[str, str]]:
